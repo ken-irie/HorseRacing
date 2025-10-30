@@ -22,6 +22,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 
 
+
 # ------------ レース情報抽出（共通）------------
 def race_info(url):
     headers = {
