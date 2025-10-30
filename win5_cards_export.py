@@ -142,27 +142,6 @@ def _decode_html(bytes_data: bytes, fallback: str = "utf-8") -> str:
     return bytes_data.decode(enc, errors="replace")
 
 
-# def _ensure_unicode(html_or_bytes) -> str:
-#     """
-#     文字化け救済: bytes なら正規にデコード。
-#     str で“化けて”いる可能性が高いときは、latin-1 でバイトに戻して再デコードを試す。
-#     """
-#     if isinstance(html_or_bytes, bytes):
-#         return _decode_html(html_or_bytes, fallback="utf-8")
-
-#     # すでに str の場合
-#     text: str = html_or_bytes
-#     # “��”が多い・EUCページでありがちな記号化けが多い → 化けてると判断
-#     if ("��" in text) or ("EUC-JP" in text and re.search(r"[^\x00-\x7F]", text) is False):
-#         # いったんバイトに戻す（元の生バイトを“そのまま”取り出すには latin-1 が有効）
-#         try:
-#             raw = text.encode("latin-1", errors="ignore")
-#             # meta から再デコード（EUC-JPが多い）
-#             return _decode_html(raw, fallback="euc-jp")
-#         except Exception:
-#             pass
-#     return text
-
 def _extract_from_html(html: str) -> pd.DataFrame | None:
     html_io = StringIO(html)
     try:
@@ -467,36 +446,7 @@ def output_fileName(url):
     # path_xlsx = os.path.join(save_dir, outfile_xlsx)
     return path_csv
 
-# # ---- ヘッダーから「場所」「R」「距離」「芝/ダ」「左/右」を抜いてシート名を作る ----
-# def _sheet_name_from_html(html: str, fallback_race_id: str = "") -> str:
-#     """
-#     ページの本文テキストから
-#       例: 「東京10R ダ1600m (左)」/「京都10R 芝1400m（右）」 等を検出して
-#     シート名「東京10R,1600メートル（ダート・左）」の形で返す。
-#     取れない場合は「race_{race_id}」を返す。
-#     """
-    
-#     # ★ここがポイント：化け対策
-#     text = _ensure_unicode(html)
-#     text = re.sub(r"\s+", " ", text)  # 改行や連続空白を1スペースに
-    
-#     # コース名 + レース番号
-#     m1 = re.search(r"([一-龥]{1,3})\s*?(\d{1,2})R", text)  # 例: 東京10R / 京都10R / 中山11R など
-#     # 芝/ダ + 距離m + (左|右)
-#     m2 = re.search(r"(芝|ダ)\s*?(\d{3,4})\s*[mｍ]\s*?[（(]\s*(左|右)\s*[）)]", text)
 
-#     if not m1 or not m2:
-#         return f"race_{fallback_race_id}" if fallback_race_id else "race_unknown"
-
-#     place = m1.group(1)            # 東京/京都/中山/阪神/新潟/札幌/函館/中京/小倉 等
-#     race_no = int(m1.group(2))     # 10 など
-#     sd = m2.group(1)               # 芝 or ダ
-#     dist = int(m2.group(2))        # 1600 など
-#     lr = m2.group(3)               # 左 or 右
-
-#     surface = "芝" if sd == "芝" else "ダート"
-#     # 完成形: 「東京10R,1600メートル（ダート・左）」
-#     return f"{place}{race_no}R,{dist}メートル（{surface}・{lr}）"
 
 def safe_sheet_name(name: str, used: set[str]) -> str:
     # """
