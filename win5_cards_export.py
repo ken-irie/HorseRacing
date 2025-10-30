@@ -150,10 +150,6 @@ def _extract_from_html(html: str) -> pd.DataFrame | None:
         html_io.seek(0)
         tables = pd.read_html(html_io)
         
-    # ★「オッズ」を必須にしないように変更（5列は必須、オッズは任意）
-    REQUIRED = {"馬番", "人気順", "馬名", "騎手名", "斤量"}  # ※人気順は後で「人気」にもマッチさせる
-    OPTIONAL = {"オッズ"}
-    
     col_patterns = {
         "馬番":   re.compile(r"(馬\s*番|枠\s*番|馬番|枠番|\b馬\s*#?)", re.I),
         "人気順": re.compile(r"(人気|単勝人気)", re.I),
