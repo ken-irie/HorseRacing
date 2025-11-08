@@ -398,6 +398,7 @@ def main():
 
                 write_sheet_as_table(writer, df, sheet)
                 written += 1
+                print(f"第{written+1}レース [{sheet}] シートに書き込み完了")
             except Exception as e:
                 msg = f"{rid}: {type(e).__name__}: {e}"
                 print("[SKIP]", msg)
