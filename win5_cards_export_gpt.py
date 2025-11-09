@@ -192,6 +192,8 @@ def _extract_table(html: str) -> pd.DataFrame | None:
         bio.seek(0)
         tables = pd.read_html(bio)
 
+    REQUIRED = {"馬番", "人気順", "オッズ", "馬名", "騎手名", "斤量", "性齢"}
+    
     col_patterns = {
         "馬番":   re.compile(r"(馬\s*番|枠\s*番|馬番|枠番|\b馬\s*#?)", re.I),
         "人気順": re.compile(r"(人気|単勝人気)", re.I),
@@ -199,6 +201,7 @@ def _extract_table(html: str) -> pd.DataFrame | None:
         "馬名":   re.compile(r"(馬\s*名|馬名|名前)", re.I),
         "騎手名": re.compile(r"(騎手|騎手名|ジョッキー)", re.I),
         "斤量":   re.compile(r"(斤量|負担重量|負担重|重量)", re.I),
+        "性齢":   re.compile(r"(性\s*齢|性齢|性別?\s*年齢|年齢\s*[／/]\s*性別?)", re.I),
     }
 
     def pick(df: pd.DataFrame) -> pd.DataFrame | None:
@@ -210,19 +213,32 @@ def _extract_table(html: str) -> pd.DataFrame | None:
             if hit:
                 mapping[hit] = want
 
-        # 足りない時だけ補完
-        if len(set(mapping.values())) < 6:
+        # 性と年齢が別カラムの表に対するフォールバック
+        if "性齢" not in mapping.values():
+            sex_col = next((c for c in cols if re.fullmatch(r"(性|性別)", c, re.I)), None)
+            age_col = next((c for c in cols if re.fullmatch(r"(年齢|年令|age)", c, re.I)), None)
+            if sex_col and age_col:
+                # 一時列を作って性齢として扱う（例: 牡 + 3 → 牡3）
+                df["_tmp_性齢"] = (
+                    df[sex_col].astype(str).str.extract(r"(牡|牝|セ|騸|騙)", expand=False).fillna("")
+                    + df[age_col].astype(str).str.extract(r"(\d+)", expand=False).fillna("")
+                )
+                mapping["_tmp_性齢"] = "性齢"
+
+        # 足りない時だけ補完（人気/オッズ/騎手/斤量の推定）
+        if len(set(mapping.values())) < len(REQUIRED):
             for c in cols:
                 if re.search(r"(印|予想印)", c) and "人気順" not in mapping.values():
                     mapping[c] = "人気順"
-                if re.search(r"(単勝|勝率)", c) and "オッズ" not in mapping.values():
+                if re.search(r"(単勝|勝率|オッズ)", c, re.I) and "オッズ" not in mapping.values():
                     mapping[c] = "オッズ"
                 if re.search(r"(騎手|ジョッキー)", c) and "騎手名" not in mapping.values():
                     mapping[c] = "騎手名"
                 if re.search(r"(斤量|負担重量|負担重|重量)", c) and "斤量" not in mapping.values():
                     mapping[c] = "斤量"
 
-        if len(set(mapping.values())) == 6:
+        # すべて揃ったら正規化して返す
+        if REQUIRED.issubset(set(mapping.values())):
             out = df[list(mapping.keys())].rename(columns=mapping).copy()
 
             # ベクトル化正規化
@@ -246,7 +262,14 @@ def _extract_table(html: str) -> pd.DataFrame | None:
             )
             out["馬名"] = out["馬名"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
 
-            return out.sort_values(["人気順", "馬番"], na_position="last", ignore_index=True)
+            # 性齢の正規化と分解（おまけ）
+            out["性齢"] = out["性齢"].astype(str).str.replace(r"\s+", "", regex=True)
+
+            # 見やすい並びにして返す（必要に応じて変更OK）
+            order = [c for c in [ "人気順", "馬番", "オッズ", "馬名", "性齢", "斤量", "騎手名"] if c in out.columns]
+            out = out[order]
+
+            return out
         return None
 
     for tb in tables:
@@ -457,8 +480,10 @@ def main():
                 print(f"第{written+1}レース [{sheet}] シートに書き込み中…")
 
                 # 並べ替え（馬番安定）
-                if "馬番" in df.columns and "人気順" in df.columns:
-                    df = df.sort_values(["馬番", "人気順"], na_position="last", ignore_index=True)
+                keys = [c for c in ["人気順", "馬番"] if c in df.columns]
+                if keys:
+                    df = df.sort_values(keys, na_position="last", ignore_index=True, kind="mergesort")
+                # df = df.sort_values(["人気順", "馬番"], na_position="last", ignore_index=True)
 
                 write_sheet_as_table(writer, df, sheet)
                 print(f"第{written+1}レース [{sheet}] シートに書き込み完了")
