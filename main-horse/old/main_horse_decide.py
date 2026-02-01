@@ -31,7 +31,7 @@ HEADERS = {
     "Referer": "https://www.netkeiba.com/",
     "Accept-Language": "ja,en;q=0.9",
 }
-idx = 0  # 土曜日はidx=0、日曜日はidx=1
+idx = 1  # 土曜日はidx=0、日曜日はidx=1
 PC_URL = f"https://race.netkeiba.com/top/win5.html?idx={idx}"
 RACE_ID_RE = re.compile(r"race_id=(\d{12})")
 
@@ -149,13 +149,13 @@ def fetch_html(url: str) -> str:
     return resp.text
 
 
-def parse_past_cell(td) -> tuple[str, str, str, str, str, str, str]:
+def parse_past_cell(td) -> tuple[str, str, str, str, str]:
     """
     過去走1つ分の <td class="Past"> から
-    (レース名, 場所, コース, 着順, 着差, 通過順, ３F) を取り出す
+    (レース名, 場所, コース, 着順, ３F) を取り出す
     """
     if td is None:
-        return "", "", "", "", "", "", ""
+        return "", "", "", "", ""
 
     # レース名（aタグ直下テキストのみ）
     race_name = ""
@@ -191,36 +191,18 @@ def parse_past_cell(td) -> tuple[str, str, str, str, str, str, str]:
     if span_num:
         finish = span_num.get_text(strip=True)
 
-    # 着差（Data07 内の (...)）
-    margin = ""
-    div_margin = td.select_one("div.Data07")
-    if div_margin:
-        t = div_margin.get_text(" ", strip=True)
-        m = re.search(r"\(([^)]+)\)", t)   # 例: "(0.3)" → "0.3"
-        if m:
-            margin = m.group(1).strip()
-
-    # Data06（通過順 + 3Fが入ってる想定）
-    passing = ""
+    # ３F（Data06 内の括弧内数値）
     last3f = ""
-    div_06 = td.select_one("div.Data06")
-    if div_06:
-        t = div_06.get_text(" ", strip=True)  # 例: "4-3-4-3 (33.9) 524(+10)"
-
-        # 通過順：先頭の "4-3-4-3" を取る（括弧の前）
-        # パターンが崩れても split の先頭で拾えるようにする
-        if t:
-            first = t.split()[0]
-            # 先頭が "4-3-4-3" 形式のときだけ採用（安全策）
-            if re.fullmatch(r"\d+(?:-\d+)+", first):
-                passing = first
-
-        # 3F：括弧内数値
+    div_3f = td.select_one("div.Data06")
+    if div_3f:
+        t = div_3f.get_text(" ", strip=True)
+        # 例: "1-1 (35.1) 504(-4)" から (35.1) を抜く
         m = re.search(r"\(([\d\.]+)\)", t)
         if m:
             last3f = m.group(1)
 
-    return race_name, place, course, finish, margin, passing, last3f
+    return race_name, place, course, finish, last3f
+
 
 # ===================== レースメタ情報抽出 =====================
 def _extract_race_meta(html: str) -> tuple[str, str, str, str, str, str]:
@@ -348,16 +330,16 @@ def extract_horse_table(html: str) -> pd.DataFrame:
         past_data = {}
         for idx, label in enumerate(labels):
             if idx < len(past_tds):
-                race_name, place, course, finish, margin, passing, last3f = parse_past_cell(past_tds[idx])
+                race_name, place, course, finish, last3f = parse_past_cell(
+                    past_tds[idx]
+                )
             else:
-                race_name, place, course, finish, margin, passing, last3f = "", "", "", "", "", "", ""
+                race_name, place, course, finish, last3f = "", "", "", "", ""
 
             past_data[f"{label}_レース名"] = race_name
             past_data[f"{label}_場所"] = place
             past_data[f"{label}_コース"] = course
             past_data[f"{label}_着順"] = finish
-            past_data[f"{label}_着差"] = margin
-            past_data[f"{label}_通過順"] = passing
             past_data[f"{label}_３F"] = last3f
 
         record = {
@@ -377,10 +359,26 @@ def extract_horse_table(html: str) -> pd.DataFrame:
         "馬名",
         "性齢",
         "騎手名",
-        "前走_レース名","前走_場所","前走_コース","前走_着順","前走_着差","前走_通過順","前走_３F",
-        "2走_レース名","2走_場所","2走_コース","2走_着順","2走_着差","2走_通過順","2走_３F",
-        "3走_レース名","3走_場所","3走_コース","3走_着順","3走_着差","3走_通過順","3走_３F",
-        "4走_レース名","4走_場所","4走_コース","4走_着順","4走_着差","4走_通過順","4走_３F",
+        "前走_レース名",
+        "前走_場所",
+        "前走_コース",
+        "前走_着順",
+        "前走_３F",
+        "2走_レース名",
+        "2走_場所",
+        "2走_コース",
+        "2走_着順",
+        "2走_３F",
+        "3走_レース名",
+        "3走_場所",
+        "3走_コース",
+        "3走_着順",
+        "3走_３F",
+        "4走_レース名",
+        "4走_場所",
+        "4走_コース",
+        "4走_着順",
+        "4走_３F",
     ]
     # 存在する列だけに絞る（念のため）
     cols = [c for c in cols if c in df.columns]
