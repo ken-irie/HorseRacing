@@ -5,15 +5,14 @@ import sys
 import time
 import math
 import datetime as dt
-from io import StringIO
-from pathlib import Path
-
 import pandas as pd
 import requests
+
+from io import StringIO
+from pathlib import Path
 from bs4 import BeautifulSoup
 from bs4 import UnicodeDammit
 from urllib.parse import urlparse, parse_qs, unquote
-
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -30,7 +29,8 @@ HEADERS = {
     "Referer": "https://www.netkeiba.com/",
     "Accept-Language": "ja,en;q=0.9",
 }
-PC_URL = "https://race.netkeiba.com/top/win5.html"
+idx = 1 #土曜日はidx=0、日曜日はidx=1
+PC_URL = f"https://race.netkeiba.com/top/win5.html?idx={idx}"
 SP_URL = "https://race.sp.netkeiba.com/?pid=win5&date={date}"  # YYYYMMDD
 RACE_ID_RE = re.compile(r"race_id=(\d{12})")
 
@@ -192,6 +192,8 @@ def _extract_table(html: str) -> pd.DataFrame | None:
         bio.seek(0)
         tables = pd.read_html(bio)
 
+    REQUIRED = {"馬番", "人気順", "オッズ", "馬名", "騎手名", "斤量", "性齢"}
+    
     col_patterns = {
         "馬番":   re.compile(r"(馬\s*番|枠\s*番|馬番|枠番|\b馬\s*#?)", re.I),
         "人気順": re.compile(r"(人気|単勝人気)", re.I),
@@ -199,6 +201,7 @@ def _extract_table(html: str) -> pd.DataFrame | None:
         "馬名":   re.compile(r"(馬\s*名|馬名|名前)", re.I),
         "騎手名": re.compile(r"(騎手|騎手名|ジョッキー)", re.I),
         "斤量":   re.compile(r"(斤量|負担重量|負担重|重量)", re.I),
+        "性齢":   re.compile(r"(性\s*齢|性齢|性別?\s*年齢|年齢\s*[／/]\s*性別?)", re.I),
     }
 
     def pick(df: pd.DataFrame) -> pd.DataFrame | None:
@@ -210,19 +213,32 @@ def _extract_table(html: str) -> pd.DataFrame | None:
             if hit:
                 mapping[hit] = want
 
-        # 足りない時だけ補完
-        if len(set(mapping.values())) < 6:
+        # 性と年齢が別カラムの表に対するフォールバック
+        if "性齢" not in mapping.values():
+            sex_col = next((c for c in cols if re.fullmatch(r"(性|性別)", c, re.I)), None)
+            age_col = next((c for c in cols if re.fullmatch(r"(年齢|年令|age)", c, re.I)), None)
+            if sex_col and age_col:
+                # 一時列を作って性齢として扱う（例: 牡 + 3 → 牡3）
+                df["_tmp_性齢"] = (
+                    df[sex_col].astype(str).str.extract(r"(牡|牝|セ|騸|騙)", expand=False).fillna("")
+                    + df[age_col].astype(str).str.extract(r"(\d+)", expand=False).fillna("")
+                )
+                mapping["_tmp_性齢"] = "性齢"
+
+        # 足りない時だけ補完（人気/オッズ/騎手/斤量の推定）
+        if len(set(mapping.values())) < len(REQUIRED):
             for c in cols:
                 if re.search(r"(印|予想印)", c) and "人気順" not in mapping.values():
                     mapping[c] = "人気順"
-                if re.search(r"(単勝|勝率)", c) and "オッズ" not in mapping.values():
+                if re.search(r"(単勝|勝率|オッズ)", c, re.I) and "オッズ" not in mapping.values():
                     mapping[c] = "オッズ"
                 if re.search(r"(騎手|ジョッキー)", c) and "騎手名" not in mapping.values():
                     mapping[c] = "騎手名"
                 if re.search(r"(斤量|負担重量|負担重|重量)", c) and "斤量" not in mapping.values():
                     mapping[c] = "斤量"
 
-        if len(set(mapping.values())) == 6:
+        # すべて揃ったら正規化して返す
+        if REQUIRED.issubset(set(mapping.values())):
             out = df[list(mapping.keys())].rename(columns=mapping).copy()
 
             # ベクトル化正規化
@@ -246,7 +262,14 @@ def _extract_table(html: str) -> pd.DataFrame | None:
             )
             out["馬名"] = out["馬名"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
 
-            return out.sort_values(["人気順", "馬番"], na_position="last", ignore_index=True)
+            # 性齢の正規化と分解（おまけ）
+            out["性齢"] = out["性齢"].astype(str).str.replace(r"\s+", "", regex=True)
+
+            # 見やすい並びにして返す（必要に応じて変更OK）
+            order = [c for c in [ "人気順", "馬番", "オッズ", "馬名", "性齢", "斤量", "騎手名"] if c in out.columns]
+            out = out[order]
+
+            return out
         return None
 
     for tb in tables:
@@ -255,23 +278,82 @@ def _extract_table(html: str) -> pd.DataFrame | None:
             return got
     return None
 
-def _extract_race_meta(html: str) -> tuple[str|None, str|None, str|None]:
+# def _extract_race_meta(html: str) -> tuple[str|None, str|None, str|None]:
+#     soup = BeautifulSoup(html, "lxml")
+#     name = soup.select_one(".RaceName")
+#     data01 = soup.select_one(".RaceData01")
+#     data02 = soup.select_one(".RaceData02")
+#     name = name.get_text(strip=True) if name else None
+#     data01 = re.sub(r"\s+", " ", data01.get_text(" ", strip=True)) if data01 else None
+#     data02 = re.sub(r"\s+", " ", data02.get_text(" ", strip=True)) if data02 else None
+#     return name, data01, data02
+
+def _extract_race_meta(html: str) -> tuple[str|None, str|None, str|None, str|None, str|None, str|None]:
     soup = BeautifulSoup(html, "lxml")
     name = soup.select_one(".RaceName")
     data01 = soup.select_one(".RaceData01")
     data02 = soup.select_one(".RaceData02")
-    name = name.get_text(strip=True) if name else None
+    rnum  = soup.select_one(".RaceNum")     # 例: 10R
+
+    # テキスト化
+    name  = name.get_text(strip=True) if name else None
     data01 = re.sub(r"\s+", " ", data01.get_text(" ", strip=True)) if data01 else None
     data02 = re.sub(r"\s+", " ", data02.get_text(" ", strip=True)) if data02 else None
-    return name, data01, data02
+    rnum  = rnum.get_text(strip=True) if rnum else None
+    place: str | None = None
+    PLACE_PATTERN = re.compile(r"(札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉)")
+
+    # rnum 正規化（"第10R" → "10R" など）
+    if rnum:
+        m = re.search(r"(\d+)\s*R", rnum, flags=re.I)
+        if m:
+            rnum = f"{int(m.group(1))}R"
+
+    if data02:
+        m = PLACE_PATTERN.search(data02)
+        if m:
+            place = m.group(1)
+
+    # --- race_date 抽出 (yyyymmdd) ---
+    race_date: str | None = None
+
+    # 1) 画面上の日本語日付から取得（例: "2025年5月5日"）
+    date_hints_selectors = [
+        ".RaceList_Date",   # まずここを試す
+        ".RaceData01",      # ここに含まれているケースもある
+        ".RaceData02",
+    ]
+    for sel in date_hints_selectors:
+        node = soup.select_one(sel)
+        if not node:
+            continue
+        txt = node.get_text(" ", strip=True)
+        m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", txt)
+        if m:
+            y, mo, d = map(int, m.groups())
+            race_date = f"{y:04d}{mo:02d}{d:02d}"
+            break
+
+    # 2) ダメなら <script> 内の埋め込み値から拾う（例: "kaisai_date":"20250505"）
+    if not race_date:
+        for s in soup.find_all("script"):
+            st = s.get_text(" ", strip=True)
+            m = re.search(r'"kaisai_date"\s*:\s*"(\d{8})"', st)
+            if not m:
+                m = re.search(r'kaisaiDate\s*[:=]\s*"(\d{8})"', st)
+            if m:
+                race_date = m.group(1)
+                break
+
+    return race_date, name, data01, data02, place, rnum
 
 def fetch_shutsuba_with_meta(url: str, timeout_sec: int = 15) -> tuple[pd.DataFrame, tuple[str,str,str]]:
     # まず静的HTML
     html = _get_html(url, timeout=timeout_sec)
     df = _extract_table(html)
-    name, d1, d2 = _extract_race_meta(html)
+    race_date, name, d1, d2, place, rnum = _extract_race_meta(html)
     if df is not None and name and d1 and d2:
-        return df, (name, d1, d2)
+        return df, (race_date, name, d1, d2, place, rnum)
 
     # ダメなら Selenium（1インスタンス使い回し）
     html2 = BROWSER.get_rendered_html(
@@ -281,9 +363,9 @@ def fetch_shutsuba_with_meta(url: str, timeout_sec: int = 15) -> tuple[pd.DataFr
         wait_odds=True
     )
     df2 = _extract_table(html2)
-    name2, d12, d22 = _extract_race_meta(html2)
+    race_date2, name2, d12, d22, place2, rnum2  = _extract_race_meta(html2)
     if df2 is not None and name2 and d12 and d22:
-        return df2, (name2, d12, d22)
+        return df2, (race_date2, name2, d12, d22, place2, rnum2)
 
     raise ValueError("出馬表テーブルが見つかりません。")
 
@@ -373,7 +455,7 @@ def main():
     race_date = dt.date.today().strftime("%Y%m%d")
     nowstamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     outdir = get_output_dir()
-    out_xlsx = outdir / f"Win5出馬表({race_date})_{nowstamp}.xlsx"
+    out_xlsx = outdir / f"Win5出馬表_{nowstamp}.xlsx"
     print(f"出力開始: {out_xlsx}")
 
     used_sheet_names: set[str] = set()
@@ -386,19 +468,26 @@ def main():
             url = f"https://race.netkeiba.com/race/shutuba.html?race_id={rid}"
             try:
                 df, meta = fetch_shutsuba_with_meta(url)
-                name, d1, d2 = meta
+                race_date, name, d1, d2, place, rnum = meta
                 if not (name and d1 and d2):
                     raise ValueError("race meta not found")
-                sheet = safe_sheet_name(name, used_sheet_names)
+                
+                # ▼シート名を「開催場所 + R番 _ レース名」にする（場所・R番が無い時はレース名のみ）
+                sheet_title = name
+                if place and rnum:
+                    sheet_title = f"{place}{rnum}_{name}"
+                sheet = safe_sheet_name(sheet_title, used_sheet_names)
                 print(f"第{written+1}レース [{sheet}] シートに書き込み中…")
 
                 # 並べ替え（馬番安定）
-                if "馬番" in df.columns and "人気順" in df.columns:
-                    df = df.sort_values(["馬番", "人気順"], na_position="last", ignore_index=True)
+                keys = [c for c in ["人気順", "馬番"] if c in df.columns]
+                if keys:
+                    df = df.sort_values(keys, na_position="last", ignore_index=True, kind="mergesort")
+                # df = df.sort_values(["人気順", "馬番"], na_position="last", ignore_index=True)
 
                 write_sheet_as_table(writer, df, sheet)
-                written += 1
                 print(f"第{written+1}レース [{sheet}] シートに書き込み完了")
+                written += 1
             except Exception as e:
                 msg = f"{rid}: {type(e).__name__}: {e}"
                 print("[SKIP]", msg)
@@ -415,4 +504,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
