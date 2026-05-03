@@ -11,6 +11,8 @@ import requests
 from io import StringIO
 from pathlib import Path
 from bs4 import BeautifulSoup
+from openpyxl import load_workbook
+from openpyxl.cell.cell import MergedCell
 from bs4 import UnicodeDammit
 from urllib.parse import urlparse, parse_qs, unquote
 from selenium import webdriver
@@ -33,6 +35,18 @@ idx = 1 #土曜日はidx=0、日曜日はidx=1
 PC_URL = f"https://race.netkeiba.com/top/win5.html?idx={idx}"
 SP_URL = "https://race.sp.netkeiba.com/?pid=win5&date={date}"  # YYYYMMDD
 RACE_ID_RE = re.compile(r"race_id=(\d{12})")
+
+# テンプレートファイル
+TEMPLATE_XLSX = Path(__file__).resolve().with_name("race_cards.xlsx")
+# オッズデータ入力シートのWIN別セクション開始列（B=2, N=14, Z=26, AL=38, AX=50）
+WIN_SECTION_COLS = [2, 14, 26, 38, 50]
+# セクション内のデータ列オフセット（数式列の差・人気順はスキップ）
+DATA_COL_OFFSETS = {"馬番": 2, "オッズ": 3, "馬名": 4, "性齢": 5, "斤量": 6, "騎手名": 7}
+DATA_START_ROW = 8
+DATA_END_ROW   = 25
+TIME_ROW       = 4
+RACE_NAME_ROW  = 5
+COURSE_ROW     = 6
 
 # ===================== 高速化：HTTPセッション =====================
 def build_session() -> requests.Session:
@@ -176,9 +190,10 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = uniq
 
     if len(df) > 0:
-        row0 = df.iloc[0].astype(str).str.replace(r"\s+", "", regex=True).tolist()
-        col0 = [c.replace(" ", "") for c in df.columns]
-        match_cnt = sum(1 for x in row0 if any(x and x in c for c in col0))
+        row0 = [str(v) for v in df.iloc[0].tolist()]
+        row0 = [re.sub(r"\s+", "", v) for v in row0]
+        col0 = [str(c).replace(" ", "") for c in df.columns]
+        match_cnt = sum(1 for x in row0 if x and any(x in c for c in col0 if c))
         if match_cnt >= max(2, len(col0)//2):
             df = df.iloc[1:].reset_index(drop=True)
     return df
@@ -404,24 +419,80 @@ def pick_win5_ids(target_url: str | None = None) -> list[str]:
     except Exception:
         return []
 
-# ===================== Excel 出力（高速：xlsxwriter 利用） =====================
-def write_sheet_as_table(writer, df: pd.DataFrame, sheet_name: str):
-    # pandas書き込み → xlsxwriter でテーブル化＆書式付け
-    df.to_excel(writer, index=False, sheet_name=sheet_name)
-    wb  = writer.book
-    ws  = writer.sheets[sheet_name]
+# ===================== メタ情報パース =====================
+def _parse_race_time(d1) -> str:
+    """RaceData01から発走時刻（HH:MM）を抽出する"""
+    if not isinstance(d1, str):
+        return ""
+    m = re.search(r"(\d{1,2}:\d{2})", d1)
+    return m.group(1) if m else ""
 
-    nrows, ncols = df.shape
-    # 見出しとバンドを xlsxwriter の Table 機能で
-    ws.add_table(0, 0, nrows, ncols-1, {
-        "columns": [{"header": c} for c in df.columns],
-        "style": "Table Style Medium 9"  # 罫線＋交互色。高速。
-    })
+def _parse_course_label(d1, d2) -> str:
+    """〇歳〇メートル（芝・右）形式の文字列を組み立てる"""
+    d1 = d1 if isinstance(d1, str) else ""
+    d2 = d2 if isinstance(d2, str) else ""
 
-    # 列幅（おおよその最適化）
-    for j, col in enumerate(df.columns):
-        width = max(8, min(28, int(df[col].astype(str).map(len).quantile(0.8)) + 2))
-        ws.set_column(j, j, width)
+    # 距離（例: 1,800m / 3000m）
+    m = re.search(r"([\d,]+)\s*m", d1)
+    dist = f"{m.group(1).replace(',', ',')}メートル" if m else ""
+
+    # 芝/ダート と 右/左/直線
+    m_surf = re.search(r"(芝|ダート|障害)", d1)
+    m_dir  = re.search(r"(?:芝|ダート|障害)[・\s]*(右|左|直線)", d1)
+    surf = m_surf.group(1) if m_surf else ""
+    drct = m_dir.group(1) if m_dir else ""
+    if surf and drct:
+        course = f"（{surf}・{drct}）"
+    elif surf:
+        course = f"（{surf}）"
+    else:
+        course = ""
+
+    # 年齢条件（例: 4歳以上 / 3歳）をd2から抽出
+    m_age = re.search(r"(\d+歳[以上未満]*)", d2)
+    age = m_age.group(1) if m_age else ""
+
+    # クラス条件（例: 3勝クラス / オープン / G1 など）
+    m_cls = re.search(r"(\d+勝クラス|オープン|G[IⅠ1iIVX]{1,3}|ハンデ|混合|牝馬限定)", d2)
+    cls = m_cls.group(1) if m_cls else ""
+
+    return f"{age}{cls}{dist}{course}".strip()
+
+# ===================== テンプレートへの書き込み =====================
+def write_race_to_odds_sheet(ws, win_idx: int, df: pd.DataFrame, race_title: str, race_time: str, course_label: str):
+    """オッズデータ入力シートの指定WIN区画にデータを書き込む"""
+    sec = WIN_SECTION_COLS[win_idx]
+
+    ws.cell(row=TIME_ROW,      column=sec).value = race_time
+    ws.cell(row=RACE_NAME_ROW, column=sec).value = race_title
+    ws.cell(row=COURSE_ROW,    column=sec).value = course_label
+
+    # 既存データをクリア（数式・結合セルはスキップ）
+    for row in range(DATA_START_ROW, DATA_END_ROW + 1):
+        for off in DATA_COL_OFFSETS.values():
+            cell = ws.cell(row=row, column=sec + off)
+            if isinstance(cell, MergedCell):
+                continue
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                continue
+            cell.value = None
+
+    # データを書き込む
+    for r_off, row_vals in enumerate(df.itertuples(index=False)):
+        r = DATA_START_ROW + r_off
+        if r > DATA_END_ROW:
+            break
+        for col_name, value in zip(df.columns, row_vals):
+            if col_name not in DATA_COL_OFFSETS:
+                continue
+            if isinstance(value, float) and math.isnan(value):
+                value = None
+            cell = ws.cell(row=r, column=sec + DATA_COL_OFFSETS[col_name])
+            if isinstance(cell, MergedCell):
+                continue
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                continue
+            cell.value = value
 
 def safe_sheet_name(name: str, used: set[str]) -> str:
     base = re.sub(r"[\\/*?:\[\]]", "_", name).strip() or "sheet"
@@ -445,60 +516,54 @@ def get_output_dir() -> Path:
 
 # ===================== メイン =====================
 def main():
-    # race_id 抽出
     url_arg = sys.argv[1] if len(sys.argv) >= 2 else None
     race_ids = pick_win5_ids(url_arg)
     if not race_ids:
         print("対象の race_id を取得できませんでした。")
         sys.exit(2)
 
-    race_date = dt.date.today().strftime("%Y%m%d")
+    if not TEMPLATE_XLSX.exists():
+        print(f"テンプレートが見つかりません: {TEMPLATE_XLSX}")
+        sys.exit(3)
+
     nowstamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     outdir = get_output_dir()
     out_xlsx = outdir / f"Win5出馬表_{nowstamp}.xlsx"
     print(f"出力開始: {out_xlsx}")
 
-    used_sheet_names: set[str] = set()
+    wb = load_workbook(TEMPLATE_XLSX)
+    ws_odds = wb["オッズデータ入力"]
+
     errors = []
     written = 0
 
-    # xlsxwriter を使う（装飾を後から openpyxl で全セル処理しない）
-    with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as writer:
-        for rid in race_ids:
-            url = f"https://race.netkeiba.com/race/shutuba.html?race_id={rid}"
-            try:
-                df, meta = fetch_shutsuba_with_meta(url)
-                race_date, name, d1, d2, place, rnum = meta
-                if not (name and d1 and d2):
-                    raise ValueError("race meta not found")
-                
-                # ▼シート名を「開催場所 + R番 _ レース名」にする（場所・R番が無い時はレース名のみ）
-                sheet_title = name
-                if place and rnum:
-                    sheet_title = f"{place}{rnum}_{name}"
-                sheet = safe_sheet_name(sheet_title, used_sheet_names)
-                print(f"第{written+1}レース [{sheet}] シートに書き込み中…")
+    for idx_r, rid in enumerate(race_ids):
+        if idx_r >= len(WIN_SECTION_COLS):
+            break
+        url = f"https://race.netkeiba.com/race/shutuba.html?race_id={rid}"
+        try:
+            df, meta = fetch_shutsuba_with_meta(url)
+            race_date, name, d1, d2, place, rnum = meta
+            if not (name and d1 and d2):
+                raise ValueError("race meta not found")
 
-                # 並べ替え（馬番安定）
-                keys = [c for c in ["人気順", "馬番"] if c in df.columns]
-                if keys:
-                    df = df.sort_values(keys, na_position="last", ignore_index=True, kind="mergesort")
-                # df = df.sort_values(["人気順", "馬番"], na_position="last", ignore_index=True)
+            race_title   = f"{place}{rnum}_{name}" if place and rnum else name
+            race_time    = _parse_race_time(d1)
+            course_label = _parse_course_label(d1, d2)
+            keys = [c for c in ["人気順", "馬番"] if c in df.columns]
+            if keys:
+                df = df.sort_values(keys, na_position="last", ignore_index=True, kind="mergesort")
 
-                write_sheet_as_table(writer, df, sheet)
-                print(f"第{written+1}レース [{sheet}] シートに書き込み完了")
-                written += 1
-            except Exception as e:
-                msg = f"{rid}: {type(e).__name__}: {e}"
-                print("[SKIP]", msg)
-                errors.append(msg)
+            print(f"第{written+1}レース [{race_title}] 書き込み中…")
+            write_race_to_odds_sheet(ws_odds, idx_r, df, race_title, race_time, course_label)
+            print(f"第{written+1}レース [{race_title}] 書き込み完了")
+            written += 1
+        except Exception as e:
+            msg = f"{rid}: {type(e).__name__}: {e}"
+            print("[SKIP]", msg)
+            errors.append(msg)
 
-        if written == 0:
-            pd.DataFrame({"info": ["no sheets written"]}).to_excel(writer, index=False, sheet_name="empty")
-        if errors:
-            pd.DataFrame({"errors": errors}).to_excel(writer, index=False, sheet_name="log")
-
-    # 使ったら閉じる（Selenium 起動していれば）
+    wb.save(out_xlsx)
     BROWSER.close()
     print(f"出力完了: {out_xlsx}")
 
