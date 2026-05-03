@@ -8,7 +8,6 @@ import datetime as dt
 import pandas as pd
 import requests
 
-from openpyxl.styles import Border, Side
 from io import StringIO
 from pathlib import Path
 from bs4 import BeautifulSoup
@@ -22,6 +21,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 from openpyxl import load_workbook
+from openpyxl.cell.cell import MergedCell
 
 # ===================== 定数 =====================
 HEADERS = {
@@ -36,7 +36,7 @@ PC_URL = f"https://race.netkeiba.com/top/win5.html?idx={idx}"
 RACE_ID_RE = re.compile(r"race_id=(\d{12})")
 
 # テンプレートファイル（スクリプトと同じフォルダに置く）
-TEMPLATE_XLSX = Path(__file__).resolve().with_name("Win5軸馬決定_テンプレート.xlsx")
+TEMPLATE_XLSX = Path(__file__).resolve().with_name("main_horse_decide_sheets.xlsx")
 # ===================== 定数 =====================
 
 # ===================== 高速化：HTTPセッション =====================
@@ -413,19 +413,27 @@ def safe_sheet_name(name: str, used: set[str]) -> str:
     return cand
 # ===================== シート名安全化 =====================
 
-# ===================== 罫線（格子）を付与 =====================
-def add_grid_border(ws):
-    """ワークシート全体に細い格子罫線を付ける"""
-    thin = Side(style="thin", color="000000")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+# ===================== テンプレートシートへデータ書き込み =====================
+def write_df_to_sheet(ws, df: pd.DataFrame):
+    """テンプレートの列名とDataFrameの列名を突き合わせて正しい列に書き込む"""
+    # テンプレート1行目のヘッダーから 列名→列番号 マッピングを構築
+    col_map: dict[str, int] = {}
+    for cell in ws[1]:
+        if cell.value is not None and not isinstance(cell, MergedCell):
+            col_map[str(cell.value)] = cell.column
 
-    max_row = ws.max_row
-    max_col = ws.max_column
-
-    for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
-        for cell in row:
-            cell.border = border
-# ===================== 罫線（格子）を付与 =====================
+    # DataFrameのデータを2行目から書き込む（列名でマッチング）
+    for r_idx, row_data in enumerate(df.itertuples(index=False), start=2):
+        for col_name, value in zip(df.columns, row_data):
+            if col_name not in col_map:
+                continue
+            cell = ws.cell(row=r_idx, column=col_map[col_name])
+            if isinstance(cell, MergedCell):
+                continue
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                continue
+            cell.value = value
+# ===================== テンプレートシートへデータ書き込み =====================
 
 def main():
     # オプションで WIN5ページのURL上書きも可
@@ -448,37 +456,41 @@ def main():
         print(f"テンプレートが見つかりません: {TEMPLATE_XLSX}")
         sys.exit(3)
 
+    # テンプレートをベースにワークブックを開く（書式・条件付き書式を引き継ぐ）
     wb = load_workbook(TEMPLATE_XLSX)
-    sheets = wb.worksheets  # 既存シート（通常5枚）
+    template_sheets = wb.worksheets  # 既存5枚シート
 
     used_sheet_names: set[str] = set()
     errors: list[str] = []
     written = 0
 
-    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
-        for idx_r, rid in enumerate(race_ids):
-            race_url = f"https://race.netkeiba.com/race/shutuba_past.html?race_id={rid}&rf=shutuba_submenu"
-            try:
-                # シート名（京都9R_秋明菊賞 のような形式にする）
-                html = fetch_html(race_url)
-                race_date, name,place, rnum = fetch_shutsuba_with_meta(race_url)
-                sheet_title = name
-                if place and rnum:
-                    sheet_title = f"{place}{rnum}_{name}"
-                sheet_title = safe_sheet_name(sheet_title, used_sheet_names)
-                print(f"[{written+1}] {sheet_title} に書き込み中…")
+    for idx_r, rid in enumerate(race_ids):
+        if idx_r >= len(template_sheets):
+            print(f"[WARN] テンプレートシートが足りません（{idx_r+1}枚目なし）")
+            break
 
-                df = extract_horse_table(html)
-                # ファイル名は適当に。race_idを使ってもOK
-                df.to_excel(writer, sheet_name=sheet_title, index=False)
-                ws = writer.sheets[sheet_title]
-                add_grid_border(ws)
-                print(f"[{written+1}] {sheet_title} に書き込み完了")     
-                written += 1
-            except Exception as e:
-                msg = f"{rid}: {type(e).__name__}: {e}"
-                print("[SKIP]", msg)
-                errors.append(msg)
+        ws = template_sheets[idx_r]
+        race_url = f"https://race.netkeiba.com/race/shutuba_past.html?race_id={rid}&rf=shutuba_submenu"
+        try:
+            html = fetch_html(race_url)
+            race_date, name, place, rnum = fetch_shutsuba_with_meta(race_url)
+            sheet_title = name
+            if place and rnum:
+                sheet_title = f"{place}{rnum}_{name}"
+            sheet_title = safe_sheet_name(sheet_title, used_sheet_names)
+            print(f"[{written+1}] {sheet_title} に書き込み中…")
+
+            df = extract_horse_table(html)
+            ws.title = sheet_title
+            write_df_to_sheet(ws, df)
+            print(f"[{written+1}] {sheet_title} に書き込み完了")
+            written += 1
+        except Exception as e:
+            msg = f"{rid}: {type(e).__name__}: {e}"
+            print("[SKIP]", msg)
+            errors.append(msg)
+
+    wb.save(out_xlsx)
     print(f"出力完了: {out_xlsx}")
 
 
