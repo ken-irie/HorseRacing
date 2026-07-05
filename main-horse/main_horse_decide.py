@@ -1,25 +1,13 @@
 # -*- coding: utf-8 -*-
-import os
 import re
 import sys
-import time
-import math
 import datetime as dt
 import pandas as pd
 import requests
 
-from io import StringIO
 from pathlib import Path
 from bs4 import BeautifulSoup
 from bs4 import UnicodeDammit
-from urllib.parse import urlparse, parse_qs, unquote
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
-from webdriver_manager.chrome import ChromeDriverManager
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 
@@ -31,7 +19,7 @@ HEADERS = {
     "Referer": "https://www.netkeiba.com/",
     "Accept-Language": "ja,en;q=0.9",
 }
-idx = 0  # 土曜日はidx=0、日曜日はidx=1
+idx = 1  # 土曜日はidx=0、日曜日はidx=1
 PC_URL = f"https://race.netkeiba.com/top/win5.html?idx={idx}"
 RACE_ID_RE = re.compile(r"race_id=(\d{12})")
 
@@ -59,7 +47,6 @@ SESSION = build_session()
 # ===================== 高速化：HTTPセッション =====================
 
 # ===================== HTMLユーティリティ =====================
-SESSION = build_session()
 def _decode_html_bytes(b: bytes, fallback: str = "utf-8") -> str:
     dammit = UnicodeDammit(b, is_html=True)
     if dammit.unicode_markup:
@@ -133,21 +120,6 @@ def pick_win5_ids(target_url: str | None = None):
         return ids[:5], date
     return ids, date
 # ===================== WIN5 race_idとrace_date 抽出 =====================
-
-def fetch_html(url: str) -> str:
-    """URLからHTML文字列を取得する"""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-    resp = requests.get(url, headers=headers)
-    # netkeiba は EUC-JP ヘッダだが、apparent_encoding に任せた方が楽
-    resp.encoding = resp.apparent_encoding
-    return resp.text
-
 
 def parse_past_cell(td) -> tuple[str, str, str, str, str, str, str]:
     """
@@ -223,7 +195,7 @@ def parse_past_cell(td) -> tuple[str, str, str, str, str, str, str]:
     return race_name, place, course, finish, margin, passing, last3f
 
 # ===================== レースメタ情報抽出 =====================
-def _extract_race_meta(html: str) -> tuple[str, str, str, str, str, str]:
+def _extract_race_meta(html: str) -> tuple[str, str, str, str]:
     soup = BeautifulSoup(html, "html.parser")
 
     name_el = soup.select_one(".RaceName")
@@ -287,11 +259,36 @@ def _extract_race_meta(html: str) -> tuple[str, str, str, str, str, str]:
 
 # ===================== サイトからデータ取得 =====================
 
+# ===================== リアルタイムオッズ取得 =====================
+def fetch_tansho_odds(race_id: str, timeout: int = 15) -> dict[str, float]:
+    """
+    netkeibaのオッズAPIから単勝オッズを取得する。
+    返り値は {馬番: オッズ} の辞書（例: {"1": 4.2, "2": 18.8}）。
+    取得失敗時や発売前は空辞書を返す。
+    """
+    url = (f"https://race.netkeiba.com/api/api_get_jra_odds.html"
+           f"?race_id={race_id}&type=1&action=init")
+    try:
+        r = SESSION.get(url, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f"[WARN] オッズ取得失敗 ({race_id}): {type(e).__name__}: {e}")
+        return {}
 
-def fetch_shutsuba_with_meta(url: str, timeout_sec: int = 15):
-    html = _get_html(url, timeout=timeout_sec)
-    race_date, name,place, rnum = _extract_race_meta(html)
-    return race_date, name,place, rnum
+    if data.get("status") != "result":
+        return {}
+
+    tansho = data.get("data", {}).get("odds", {}).get("1", {})
+    result: dict[str, float] = {}
+    for umaban, values in tansho.items():
+        # values は [オッズ, 変動値, 人気順] の形式
+        try:
+            result[str(int(umaban))] = float(values[0])
+        except (ValueError, TypeError, IndexError):
+            continue  # 発売前は "---.-" などが入るためスキップ
+    return result
+# ===================== リアルタイムオッズ取得 =====================
 
 def extract_horse_table(html: str) -> pd.DataFrame:
     """
@@ -346,9 +343,9 @@ def extract_horse_table(html: str) -> pd.DataFrame:
         # 取りたいのは 前走, 2走, 3走, 4走 の4つ
         labels = ["前走", "2走", "3走", "4走"]
         past_data = {}
-        for idx, label in enumerate(labels):
-            if idx < len(past_tds):
-                race_name, place, course, finish, margin, passing, last3f = parse_past_cell(past_tds[idx])
+        for i, label in enumerate(labels):
+            if i < len(past_tds):
+                race_name, place, course, finish, margin, passing, last3f = parse_past_cell(past_tds[i])
             else:
                 race_name, place, course, finish, margin, passing, last3f = "", "", "", "", "", "", ""
 
@@ -472,8 +469,8 @@ def main():
         ws = template_sheets[idx_r]
         race_url = f"https://race.netkeiba.com/race/shutuba_past.html?race_id={rid}&rf=shutuba_submenu"
         try:
-            html = fetch_html(race_url)
-            race_date, name, place, rnum = fetch_shutsuba_with_meta(race_url)
+            html = _get_html(race_url)
+            _, name, place, rnum = _extract_race_meta(html)
             sheet_title = name
             if place and rnum:
                 sheet_title = f"{place}{rnum}_{name}"
@@ -481,6 +478,12 @@ def main():
             print(f"[{written+1}] {sheet_title} に書き込み中…")
 
             df = extract_horse_table(html)
+
+            # リアルタイム単勝オッズをテンプレートの「オッズ」列に反映
+            odds_map = fetch_tansho_odds(rid)
+            if odds_map:
+                df["オッズ"] = df["馬番"].map(lambda x: odds_map.get(str(x).strip(), ""))
+
             ws.title = sheet_title
             write_df_to_sheet(ws, df)
             print(f"[{written+1}] {sheet_title} に書き込み完了")
@@ -491,7 +494,11 @@ def main():
             errors.append(msg)
 
     wb.save(out_xlsx)
-    print(f"出力完了: {out_xlsx}")
+    print(f"出力完了: {out_xlsx}（{written}/{len(race_ids)}レース書き込み）")
+    if errors:
+        print("エラーがあったレース:")
+        for msg in errors:
+            print(" -", msg)
 
 
 if __name__ == "__main__":
