@@ -23,7 +23,11 @@ HEADERS = {
     "Referer": "https://www.netkeiba.com/",
     "Accept-Language": "ja,en;q=0.9",
 }
-idx = 1 #土曜日はidx=0、日曜日はidx=1
+# 土曜日はidx=0、日曜日はidx=1（launcher.pyからは環境変数WIN5_IDXで上書きされる）
+try:
+    idx = int(os.environ.get("WIN5_IDX", "1"))
+except ValueError:
+    idx = 1
 PC_URL = f"https://race.netkeiba.com/top/win5.html?idx={idx}"
 SP_URL = "https://race.sp.netkeiba.com/?pid=win5&date={date}"  # YYYYMMDD
 SHUTUBA_URL = "https://race.netkeiba.com/race/shutuba.html?race_id={rid}"

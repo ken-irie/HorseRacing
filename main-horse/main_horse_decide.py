@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import os
 import re
 import sys
 import datetime as dt
@@ -19,7 +20,11 @@ HEADERS = {
     "Referer": "https://www.netkeiba.com/",
     "Accept-Language": "ja,en;q=0.9",
 }
-idx = 1  # 土曜日はidx=0、日曜日はidx=1
+# 土曜日はidx=0、日曜日はidx=1（launcher.pyからは環境変数WIN5_IDXで上書きされる）
+try:
+    idx = int(os.environ.get("WIN5_IDX", "1"))
+except ValueError:
+    idx = 1
 PC_URL = f"https://race.netkeiba.com/top/win5.html?idx={idx}"
 RACE_ID_RE = re.compile(r"race_id=(\d{12})")
 
