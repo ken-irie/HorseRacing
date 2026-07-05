@@ -8,20 +8,12 @@ import datetime as dt
 import pandas as pd
 import requests
 
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 from pathlib import Path
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, UnicodeDammit
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
-from bs4 import UnicodeDammit
-from urllib.parse import urlparse, parse_qs, unquote
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
-from webdriver_manager.chrome import ChromeDriverManager
 
 # ===================== 定数 =====================
 HEADERS = {
@@ -34,6 +26,9 @@ HEADERS = {
 idx = 1 #土曜日はidx=0、日曜日はidx=1
 PC_URL = f"https://race.netkeiba.com/top/win5.html?idx={idx}"
 SP_URL = "https://race.sp.netkeiba.com/?pid=win5&date={date}"  # YYYYMMDD
+SHUTUBA_URL = "https://race.netkeiba.com/race/shutuba.html?race_id={rid}"
+# 出馬表ページのJSが叩いている単勝オッズAPI（type=1が単勝）
+ODDS_API_URL = "https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={rid}&type=1&action=update"
 RACE_ID_RE = re.compile(r"race_id=(\d{12})")
 
 # テンプレートファイル
@@ -60,8 +55,9 @@ def build_session() -> requests.Session:
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",)
     )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.mount("http://", HTTPAdapter(max_retries=retry))
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     return s
 
 SESSION = build_session()
@@ -80,11 +76,15 @@ def _get_html(url: str, timeout: int = 15) -> str:
 
 # ===================== Selenium（必要時のみ） =====================
 class LazyBrowser:
-    """必要な時だけ起動し、プロセスは使い回す。"""
+    """必要な時だけ起動し、プロセスは使い回す。selenium系のimportも初回起動まで遅延させる。"""
     def __init__(self):
         self._driver = None
 
     def _new_driver(self):
+        from selenium import webdriver
+        from selenium.webdriver.chrome.service import Service as ChromeService
+        from webdriver_manager.chrome import ChromeDriverManager
+
         os.environ["WDM_LOG"] = "0"
         os.environ["WDM_PRINT_FIRST_LINE"] = "False"
         options = webdriver.ChromeOptions()
@@ -117,6 +117,11 @@ class LazyBrowser:
         return self._driver
 
     def get_rendered_html(self, url: str, wait_css: str = None, hard_timeout: int = 25, wait_odds: bool = False) -> str:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.common.exceptions import TimeoutException
+
         d = self.driver
         try:
             try:
@@ -155,6 +160,7 @@ class LazyBrowser:
             return d.page_source
         except Exception:
             return d.page_source
+
     def close(self):
         try:
             if self._driver:
@@ -198,32 +204,41 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             df = df.iloc[1:].reset_index(drop=True)
     return df
 
-def _extract_table(html: str) -> pd.DataFrame | None:
+REQUIRED_COLS = {"馬番", "人気順", "オッズ", "馬名", "騎手名", "斤量", "性齢"}
+COL_PATTERNS = {
+    "馬番":   re.compile(r"(馬\s*番|枠\s*番|馬番|枠番|\b馬\s*#?)", re.I),
+    "人気順": re.compile(r"(人気|単勝人気)", re.I),
+    "オッズ": re.compile(r"(オッズ|単勝)", re.I),
+    "馬名":   re.compile(r"(馬\s*名|馬名|名前)", re.I),
+    "騎手名": re.compile(r"(騎手|騎手名|ジョッキー)", re.I),
+    "斤量":   re.compile(r"(斤量|負担重量|負担重|重量)", re.I),
+    "性齢":   re.compile(r"(性\s*齢|性齢|性別?\s*年齢|年齢\s*[／/]\s*性別?)", re.I),
+}
+
+def _extract_table(html: str, require_odds: bool = True) -> pd.DataFrame | None:
+    """出馬表テーブルを抽出する。
+
+    require_odds=False のときはオッズ・人気順が無くても受理する
+    （静的HTMLではJS未実行でオッズが空のため。後段でオッズAPIから補完する）。
+    """
+    required = REQUIRED_COLS if require_odds else REQUIRED_COLS - {"オッズ", "人気順"}
+
     # pandas はファイルライクの方が速い
     bio = StringIO(html)
     try:
         tables = pd.read_html(bio, flavor="lxml")
     except Exception:
         bio.seek(0)
-        tables = pd.read_html(bio)
-
-    REQUIRED = {"馬番", "人気順", "オッズ", "馬名", "騎手名", "斤量", "性齢"}
-    
-    col_patterns = {
-        "馬番":   re.compile(r"(馬\s*番|枠\s*番|馬番|枠番|\b馬\s*#?)", re.I),
-        "人気順": re.compile(r"(人気|単勝人気)", re.I),
-        "オッズ": re.compile(r"(オッズ|単勝)", re.I),
-        "馬名":   re.compile(r"(馬\s*名|馬名|名前)", re.I),
-        "騎手名": re.compile(r"(騎手|騎手名|ジョッキー)", re.I),
-        "斤量":   re.compile(r"(斤量|負担重量|負担重|重量)", re.I),
-        "性齢":   re.compile(r"(性\s*齢|性齢|性別?\s*年齢|年齢\s*[／/]\s*性別?)", re.I),
-    }
+        try:
+            tables = pd.read_html(bio)
+        except Exception:
+            return None
 
     def pick(df: pd.DataFrame) -> pd.DataFrame | None:
         df = _normalize_columns(df)
         cols = [str(c) for c in df.columns]
         mapping = {}
-        for want, pat in col_patterns.items():
+        for want, pat in COL_PATTERNS.items():
             hit = next((c for c in cols if pat.search(c)), None)
             if hit:
                 mapping[hit] = want
@@ -241,7 +256,7 @@ def _extract_table(html: str) -> pd.DataFrame | None:
                 mapping["_tmp_性齢"] = "性齢"
 
         # 足りない時だけ補完（人気/オッズ/騎手/斤量の推定）
-        if len(set(mapping.values())) < len(REQUIRED):
+        if len(set(mapping.values())) < len(REQUIRED_COLS):
             for c in cols:
                 if re.search(r"(印|予想印)", c) and "人気順" not in mapping.values():
                     mapping[c] = "人気順"
@@ -253,8 +268,12 @@ def _extract_table(html: str) -> pd.DataFrame | None:
                     mapping[c] = "斤量"
 
         # すべて揃ったら正規化して返す
-        if REQUIRED.issubset(set(mapping.values())):
+        if required.issubset(set(mapping.values())):
             out = df[list(mapping.keys())].rename(columns=mapping).copy()
+            # オッズ・人気順が無い場合は空列を用意（後段でAPIから補完）
+            for c in ("人気順", "オッズ"):
+                if c not in out.columns:
+                    out[c] = float("nan")
 
             # ベクトル化正規化
             out["人気順"] = pd.to_numeric(
@@ -277,14 +296,12 @@ def _extract_table(html: str) -> pd.DataFrame | None:
             )
             out["馬名"] = out["馬名"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
 
-            # 性齢の正規化と分解（おまけ）
+            # 性齢の正規化
             out["性齢"] = out["性齢"].astype(str).str.replace(r"\s+", "", regex=True)
 
-            # 見やすい並びにして返す（必要に応じて変更OK）
-            order = [c for c in [ "人気順", "馬番", "オッズ", "馬名", "性齢", "斤量", "騎手名"] if c in out.columns]
-            out = out[order]
-
-            return out
+            # 見やすい並びにして返す
+            order = [c for c in ["人気順", "馬番", "オッズ", "馬名", "性齢", "斤量", "騎手名"] if c in out.columns]
+            return out[order]
         return None
 
     for tb in tables:
@@ -293,17 +310,10 @@ def _extract_table(html: str) -> pd.DataFrame | None:
             return got
     return None
 
-# def _extract_race_meta(html: str) -> tuple[str|None, str|None, str|None]:
-#     soup = BeautifulSoup(html, "lxml")
-#     name = soup.select_one(".RaceName")
-#     data01 = soup.select_one(".RaceData01")
-#     data02 = soup.select_one(".RaceData02")
-#     name = name.get_text(strip=True) if name else None
-#     data01 = re.sub(r"\s+", " ", data01.get_text(" ", strip=True)) if data01 else None
-#     data02 = re.sub(r"\s+", " ", data02.get_text(" ", strip=True)) if data02 else None
-#     return name, data01, data02
+PLACE_PATTERN = re.compile(r"(札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉)")
 
-def _extract_race_meta(html: str) -> tuple[str|None, str|None, str|None, str|None, str|None, str|None]:
+def _extract_race_meta(html: str) -> tuple[str | None, str | None, str | None, str | None, str | None, str | None]:
+    """(race_date, name, data01, data02, place, rnum) を返す"""
     soup = BeautifulSoup(html, "lxml")
     name = soup.select_one(".RaceName")
     data01 = soup.select_one(".RaceData01")
@@ -316,7 +326,6 @@ def _extract_race_meta(html: str) -> tuple[str|None, str|None, str|None, str|Non
     data02 = re.sub(r"\s+", " ", data02.get_text(" ", strip=True)) if data02 else None
     rnum  = rnum.get_text(strip=True) if rnum else None
     place: str | None = None
-    PLACE_PATTERN = re.compile(r"(札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉)")
 
     # rnum 正規化（"第10R" → "10R" など）
     if rnum:
@@ -333,17 +342,11 @@ def _extract_race_meta(html: str) -> tuple[str|None, str|None, str|None, str|Non
     race_date: str | None = None
 
     # 1) 画面上の日本語日付から取得（例: "2025年5月5日"）
-    date_hints_selectors = [
-        ".RaceList_Date",   # まずここを試す
-        ".RaceData01",      # ここに含まれているケースもある
-        ".RaceData02",
-    ]
-    for sel in date_hints_selectors:
+    for sel in (".RaceList_Date", ".RaceData01", ".RaceData02"):
         node = soup.select_one(sel)
         if not node:
             continue
-        txt = node.get_text(" ", strip=True)
-        m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", txt)
+        m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", node.get_text(" ", strip=True))
         if m:
             y, mo, d = map(int, m.groups())
             race_date = f"{y:04d}{mo:02d}{d:02d}"
@@ -353,40 +356,85 @@ def _extract_race_meta(html: str) -> tuple[str|None, str|None, str|None, str|Non
     if not race_date:
         for s in soup.find_all("script"):
             st = s.get_text(" ", strip=True)
-            m = re.search(r'"kaisai_date"\s*:\s*"(\d{8})"', st)
-            if not m:
-                m = re.search(r'kaisaiDate\s*[:=]\s*"(\d{8})"', st)
+            m = re.search(r'"kaisai_date"\s*:\s*"(\d{8})"', st) or re.search(r'kaisaiDate\s*[:=]\s*"(\d{8})"', st)
             if m:
                 race_date = m.group(1)
                 break
 
     return race_date, name, data01, data02, place, rnum
 
-def fetch_shutsuba_with_meta(url: str, timeout_sec: int = 15) -> tuple[pd.DataFrame, tuple[str,str,str]]:
-    # まず静的HTML
-    html = _get_html(url, timeout=timeout_sec)
+def _parse_page(html: str) -> tuple[pd.DataFrame, tuple] | None:
+    """出馬表テーブルとメタ情報が両方取れたときだけ返す"""
     df = _extract_table(html)
-    race_date, name, d1, d2, place, rnum = _extract_race_meta(html)
+    meta = _extract_race_meta(html)
+    _, name, d1, d2, _, _ = meta
     if df is not None and name and d1 and d2:
-        return df, (race_date, name, d1, d2, place, rnum)
+        return df, meta
+    return None
 
-    # ダメなら Selenium（1インスタンス使い回し）
-    html2 = BROWSER.get_rendered_html(
+def _fetch_tan_odds(rid: str, timeout_sec: int = 10) -> dict[int, tuple[float, float]] | None:
+    """単勝オッズAPIから {馬番: (オッズ, 人気)} を取得する。失敗は None"""
+    try:
+        r = SESSION.get(ODDS_API_URL.format(rid=rid), timeout=timeout_sec)
+        r.raise_for_status()
+        tan = r.json()["data"]["odds"]["1"]
+        out = {}
+        for umaban, vals in tan.items():
+            try:
+                num = int(umaban)
+                odds = float(vals[0])
+            except (ValueError, TypeError, IndexError):
+                continue
+            try:
+                ninki = float(vals[2])
+            except (ValueError, TypeError, IndexError):
+                ninki = float("nan")
+            out[num] = (odds, ninki)
+        return out or None
+    except Exception:
+        return None
+
+def fetch_static(rid: str, timeout_sec: int = 15) -> tuple[pd.DataFrame, tuple] | None:
+    """静的HTML＋オッズAPIでの取得を試みる（並列実行用。失敗は None）"""
+    try:
+        html = _get_html(SHUTUBA_URL.format(rid=rid), timeout=timeout_sec)
+        df = _extract_table(html, require_odds=False)
+        meta = _extract_race_meta(html)
+        _, name, d1, d2, _, _ = meta
+        if df is None or not (name and d1 and d2):
+            return None
+
+        # 静的HTMLはオッズがJS描画のため空 → オッズAPIから補完
+        if df["オッズ"].isna().all():
+            odds_map = _fetch_tan_odds(rid)
+            if odds_map:
+                nums = df["馬番"]
+                df["オッズ"] = [odds_map.get(int(u), (float("nan"),) * 2)[0] if pd.notna(u) else float("nan") for u in nums]
+                df["人気順"] = [odds_map.get(int(u), (float("nan"),) * 2)[1] if pd.notna(u) else float("nan") for u in nums]
+
+        # それでもオッズが取れないときは Selenium フォールバックに回す
+        if df["オッズ"].isna().all():
+            return None
+        return df, meta
+    except Exception:
+        return None
+
+def fetch_rendered(url: str) -> tuple[pd.DataFrame, tuple]:
+    """Seleniumでレンダリングして取得（静的取得のフォールバック）"""
+    html = BROWSER.get_rendered_html(
         url,
         wait_css=".Shutuba_Table, table.RaceTable01, .RaceTable01",
         hard_timeout=30,
         wait_odds=True
     )
-    df2 = _extract_table(html2)
-    race_date2, name2, d12, d22, place2, rnum2  = _extract_race_meta(html2)
-    if df2 is not None and name2 and d12 and d22:
-        return df2, (race_date2, name2, d12, d22, place2, rnum2)
-
-    raise ValueError("出馬表テーブルが見つかりません。")
+    got = _parse_page(html)
+    if got is None:
+        raise ValueError("出馬表テーブルが見つかりません。")
+    return got
 
 # ===================== WIN5 race_id 抽出（PC→SP フォールバック） =====================
 def _extract_ids_from_html(html: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     ids, seen = [], set()
     for a in soup.find_all("a", href=True):
         m = RACE_ID_RE.search(a["href"])
@@ -434,12 +482,13 @@ def _parse_course_label(d1, d2) -> str:
 
     # 距離（例: 1,800m / 3000m）
     m = re.search(r"([\d,]+)\s*m", d1)
-    dist = f"{m.group(1).replace(',', ',')}メートル" if m else ""
+    dist = f"{m.group(1)}メートル" if m else ""
 
-    # 芝/ダート と 右/左/直線
-    m_surf = re.search(r"(芝|ダート|障害)", d1)
-    m_dir  = re.search(r"(?:芝|ダート|障害)[・\s]*(右|左|直線)", d1)
-    surf = m_surf.group(1) if m_surf else ""
+    # 芝/ダート と 右/左/直線（netkeiba表記は「ダ1700m (右)」「芝1800m (右 A)」など）
+    m_surf = re.search(r"(障害|障|ダート|ダ|芝)", d1)
+    m_dir  = re.search(r"[(（]\s*(右|左|直線)", d1)
+    surf_map = {"芝": "芝", "ダ": "ダート", "ダート": "ダート", "障": "障害", "障害": "障害"}
+    surf = surf_map.get(m_surf.group(1), "") if m_surf else ""
     drct = m_dir.group(1) if m_dir else ""
     if surf and drct:
         course = f"（{surf}・{drct}）"
@@ -494,17 +543,6 @@ def write_race_to_odds_sheet(ws, win_idx: int, df: pd.DataFrame, race_title: str
                 continue
             cell.value = value
 
-def safe_sheet_name(name: str, used: set[str]) -> str:
-    base = re.sub(r"[\\/*?:\[\]]", "_", name).strip() or "sheet"
-    base = base[:31]
-    cand, i = base, 2
-    while cand in used:
-        suf = f"_{i}"
-        cand = (base[:max(0, 31 - len(suf))] + suf)[:31]
-        i += 1
-    used.add(cand)
-    return cand
-
 def get_output_dir() -> Path:
     try:
         base = Path(__file__).resolve().parent
@@ -516,6 +554,7 @@ def get_output_dir() -> Path:
 
 # ===================== メイン =====================
 def main():
+    t_start = time.time()
     url_arg = sys.argv[1] if len(sys.argv) >= 2 else None
     race_ids = pick_win5_ids(url_arg)
     if not race_ids:
@@ -534,18 +573,23 @@ def main():
     wb = load_workbook(TEMPLATE_XLSX)
     ws_odds = wb["オッズデータ入力"]
 
+    # 静的HTML＋オッズAPIを並列取得（失敗したレースだけ後段でSeleniumフォールバック）
+    race_ids = race_ids[:len(WIN_SECTION_COLS)]
+    print(f"{len(race_ids)}レースを並列取得中…")
+    with ThreadPoolExecutor(max_workers=len(race_ids)) as ex:
+        results = list(ex.map(fetch_static, race_ids))
+
     errors = []
     written = 0
 
-    for idx_r, rid in enumerate(race_ids):
-        if idx_r >= len(WIN_SECTION_COLS):
-            break
-        url = f"https://race.netkeiba.com/race/shutuba.html?race_id={rid}"
+    for idx_r, (rid, got) in enumerate(zip(race_ids, results)):
         try:
-            df, meta = fetch_shutsuba_with_meta(url)
-            race_date, name, d1, d2, place, rnum = meta
-            if not (name and d1 and d2):
-                raise ValueError("race meta not found")
+            if got is None:
+                print(f"第{idx_r+1}レース: 静的取得失敗 → Seleniumで再取得中…")
+                got = fetch_rendered(SHUTUBA_URL.format(rid=rid))
+
+            df, meta = got
+            _, name, d1, d2, place, rnum = meta
 
             race_title   = f"{place}{rnum}_{name}" if place and rnum else name
             race_time    = _parse_race_time(d1)
@@ -554,9 +598,8 @@ def main():
             if keys:
                 df = df.sort_values(keys, na_position="last", ignore_index=True, kind="mergesort")
 
-            print(f"第{written+1}レース [{race_title}] 書き込み中…")
             write_race_to_odds_sheet(ws_odds, idx_r, df, race_title, race_time, course_label)
-            print(f"第{written+1}レース [{race_title}] 書き込み完了")
+            print(f"第{idx_r+1}レース [{race_title}] 書き込み完了（{len(df)}頭）")
             written += 1
         except Exception as e:
             msg = f"{rid}: {type(e).__name__}: {e}"
@@ -565,7 +608,11 @@ def main():
 
     wb.save(out_xlsx)
     BROWSER.close()
-    print(f"出力完了: {out_xlsx}")
+    print(f"出力完了: {out_xlsx}（{written}/{len(race_ids)}レース、{time.time() - t_start:.1f}秒）")
+    if errors:
+        print("スキップしたレース:")
+        for msg in errors:
+            print(" -", msg)
 
 if __name__ == "__main__":
     main()

@@ -1,2 +1,4 @@
 /.output/
 /.old/
+**/output/
+**/__pycache__/
