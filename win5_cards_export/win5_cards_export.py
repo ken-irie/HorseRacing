@@ -3,7 +3,6 @@ import os
 import re
 import sys
 import time
-import math
 import datetime as dt
 import pandas as pd
 import requests
@@ -398,6 +397,22 @@ def _fetch_tan_odds(rid: str, timeout_sec: int = 10) -> dict[int, tuple[float, f
     except Exception:
         return None
 
+def _extract_provisional_numbers(html: str) -> dict[str, int]:
+    """出馬表の行id（tr_N）から {馬名: 仮馬番} を作る。
+
+    枠順確定前は馬番セルが空だが、行idのNがオッズAPIのキーと一致するため、
+    馬名経由でオッズを紐付けられる。
+    """
+    soup = BeautifulSoup(html, "lxml")
+    out = {}
+    for tr in soup.select("tr.HorseList"):
+        m = re.fullmatch(r"tr_(\d+)", tr.get("id", ""))
+        name_el = tr.select_one(".HorseName")
+        if m and name_el:
+            name = re.sub(r"\s+", " ", name_el.get_text(strip=True)).strip()
+            out[name] = int(m.group(1))
+    return out
+
 def fetch_static(rid: str, timeout_sec: int = 15) -> tuple[pd.DataFrame, tuple] | None:
     """静的HTML＋オッズAPIでの取得を試みる（並列実行用。失敗は None）"""
     try:
@@ -412,9 +427,16 @@ def fetch_static(rid: str, timeout_sec: int = 15) -> tuple[pd.DataFrame, tuple] 
         if df["オッズ"].isna().all():
             odds_map = _fetch_tan_odds(rid)
             if odds_map:
-                nums = df["馬番"]
-                df["オッズ"] = [odds_map.get(int(u), (float("nan"),) * 2)[0] if pd.notna(u) else float("nan") for u in nums]
-                df["人気順"] = [odds_map.get(int(u), (float("nan"),) * 2)[1] if pd.notna(u) else float("nan") for u in nums]
+                nan2 = (float("nan"),) * 2
+                if df["馬番"].notna().any():
+                    # 枠順確定後: 馬番で紐付け
+                    keys = [int(u) if pd.notna(u) else -1 for u in df["馬番"]]
+                else:
+                    # 枠順確定前: 行id（tr_N）の仮馬番を馬名経由で紐付け
+                    prov = _extract_provisional_numbers(html)
+                    keys = [prov.get(n, -1) for n in df["馬名"]]
+                df["オッズ"] = [odds_map.get(k, nan2)[0] for k in keys]
+                df["人気順"] = [odds_map.get(k, nan2)[1] for k in keys]
 
         # それでもオッズが取れないときは Selenium フォールバックに回す
         if df["オッズ"].isna().all():
@@ -538,7 +560,8 @@ def write_race_to_odds_sheet(ws, win_idx: int, df: pd.DataFrame, race_title: str
         for col_name, value in zip(df.columns, row_vals):
             if col_name not in DATA_COL_OFFSETS:
                 continue
-            if isinstance(value, float) and math.isnan(value):
+            # NaN / pd.NA（枠順確定前の馬番など）は空セルにする
+            if value is not None and not isinstance(value, str) and pd.isna(value):
                 value = None
             cell = ws.cell(row=r, column=sec + DATA_COL_OFFSETS[col_name])
             if isinstance(cell, MergedCell):

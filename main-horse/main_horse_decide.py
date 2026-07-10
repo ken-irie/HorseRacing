@@ -438,6 +438,9 @@ def write_df_to_sheet(ws, df: pd.DataFrame):
                 continue
             if isinstance(cell.value, str) and cell.value.startswith("="):
                 continue
+            # NaN / pd.NA（枠順確定前の馬番など）は空セルにする
+            if value is not None and not isinstance(value, str) and pd.isna(value):
+                value = None
             cell.value = value
 # ===================== テンプレートシートへデータ書き込み =====================
 
