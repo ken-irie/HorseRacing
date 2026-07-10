@@ -87,8 +87,13 @@ netkeiba.com から WIN5 対象レースの出馬表データを取得し、既�
 python win5_cards_export.py
 ```
 
-`idx = 1`（日曜日）の WIN5 デフォルトレースを処理します。  
-土曜日にする場合はスクリプト冒頭の `idx = 0` に変更してください。
+対象日は環境変数 `WIN5_IDX` で指定します（0=土曜, 1=日曜。未指定時は 1）。
+親フォルダの `launcher.py`（ブラウザ画面）から実行する場合は画面上の選択が自動で渡されます。
+
+```bash
+set WIN5_IDX=0
+python win5_cards_export.py
+```
 
 ### WIN5 ページ URL を指定
 
@@ -134,10 +139,14 @@ pip install requests beautifulsoup4 chardet pandas lxml selenium openpyxl webdri
 - 書式・条件付き書式・計算式・セル結合を一切壊さない
 - データは列名マッピングではなく**固定オフセット**で書き込み（WIN別に +2〜+7）
 
-### 静的 HTML → Selenium フォールバック
-- 静的 HTML で出馬表が取得できた場合はそのまま使用（高速）
-- JavaScript レンダリングが必要な場合のみ Selenium を起動（LazyBrowser で遅延初期化）
-- Selenium インスタンスは使い回し（5 レース処理中に 1 回だけ起動）
+### 静的 HTML＋オッズAPI → Selenium フォールバック
+- 5 レースの静的 HTML を **ThreadPoolExecutor で並列取得**（全体で数秒）
+- オッズは JS 描画のため静的 HTML には入っていない → **netkeiba のオッズAPI**
+  （`api_get_jra_odds.html?race_id=…&type=1`）から直接取得して馬番で紐付け
+- **枠順確定前**（馬番が空）は、出馬表の行 id `tr_N` の N がオッズAPIのキーと
+  一致することを利用し、馬名→tr番号→オッズで紐付け（馬番列は空欄で出力）
+- 発売前はAPIが予想オッズ（status=yoso）を返すため、それをそのまま使用
+- 上記がすべて失敗した場合のみ Selenium を起動（LazyBrowser で遅延初期化・使い回し）
 
 ### エラーハンドリング
 - 1 レースの取得失敗は `[SKIP]` で記録して次レースへ継続
@@ -147,7 +156,7 @@ pip install requests beautifulsoup4 chardet pandas lxml selenium openpyxl webdri
 
 | 定数 | 値 | 説明 |
 |------|----|------|
-| `idx` | `1` | 0=土曜, 1=日曜 |
+| `idx` | 環境変数 `WIN5_IDX`（既定 1） | 0=土曜, 1=日曜 |
 | `TEMPLATE_XLSX` | `race_cards.xlsx` | テンプレートファイルパス |
 | `WIN_SECTION_COLS` | `[2,14,26,38,50]` | WIN1〜5 のセクション開始列 |
 | `DATA_COL_OFFSETS` | `{馬番:2, …}` | セクション内データ列オフセット |

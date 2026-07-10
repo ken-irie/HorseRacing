@@ -48,7 +48,13 @@ netkeiba.com から WIN5 馬券の対象レース情報をスクレイピング�
 python main_horse_decide.py
 ```
 
-土曜日（idx=0）の WIN5 デフォルトレースを処理します。
+対象日は環境変数 `WIN5_IDX` で指定します（0=土曜, 1=日曜。未指定時は 1）。
+親フォルダの `launcher.py`（ブラウザ画面）から実行する場合は画面上の選択が自動で渡されます。
+
+```bash
+set WIN5_IDX=0
+python main_horse_decide.py
+```
 
 ### WIN5 ページ URL を指定
 
@@ -56,15 +62,20 @@ python main_horse_decide.py
 python main_horse_decide.py "https://race.netkeiba.com/top/win5.html?idx=1"
 ```
 
-日曜日（idx=1）の WIN5 を処理したい場合など、URL を指定できます。
+URL を直接指定して環境変数より優先させることもできます。
 
 ## 入出力
 
 ### 入力
 - **WIN5 ページ URL**（オプション）
-  - デフォルト: `https://race.netkeiba.com/top/win5.html?idx=0`（土曜日）
-  - 環境変数 `PC_URL` または コマンドラインで上書き可能
+  - デフォルト: `https://race.netkeiba.com/top/win5.html?idx={WIN5_IDX}`（未指定時 idx=1）
+  - コマンドライン引数で上書き可能
   - 対象は最大 5 レース
+
+### オッズについて
+- netkeiba のオッズAPIから単勝オッズを取得し、テンプレートの「オッズ」列に反映
+- 馬券発売前は netkeiba の**予想オッズ**（status=yoso）を使用（ログに `[INFO] 発売前のため予想オッズを使用します` と表示）
+- 発売開始後に再実行すると実オッズに置き換わる
 
 ### 出力
 - **ファイル名**: `output/Win5軸馬決定_YYYYMMDD_TIMESTAMP.xlsx`
@@ -122,7 +133,7 @@ pip install requests beautifulsoup4 pandas openpyxl selenium webdriver-manager
 ## 環境変数と定数
 
 - `HEADERS` - User-Agent など HTTP ヘッダ
-- `PC_URL` - デフォルト WIN5 ページ URL（idx=0: 土曜日、idx=1: 日曜日）
+- `PC_URL` - デフォルト WIN5 ページ URL（idx は環境変数 `WIN5_IDX`、0: 土曜日、1: 日曜日）
 - `RACE_ID_RE` - race_id 抽出用正規表現（`race_id=\d{12}`）
 
 ## 技術仕様
