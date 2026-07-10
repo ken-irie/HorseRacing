@@ -281,10 +281,9 @@ def fetch_tansho_odds(race_id: str, timeout: int = 15) -> dict[str, float]:
         print(f"[WARN] オッズ取得失敗 ({race_id}): {type(e).__name__}: {e}")
         return {}
 
-    # 発売中〜確定は "result"、発売前は "yoso"（netkeibaの予想オッズ）が返る
+    # status: "result"=確定 / "middle"=発売中の暫定 / "yoso"=発売前の予想オッズ
+    # statusでは弾かず、オッズデータが取れたものをそのまま使う
     status = data.get("status")
-    if status not in ("result", "yoso"):
-        return {}
     if status == "yoso":
         print(f"[INFO] 発売前のため予想オッズを使用します ({race_id})")
 
