@@ -2,10 +2,11 @@
 import os
 import re
 import sys
+import time
 import datetime as dt
-import pandas as pd
 import requests
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from bs4 import BeautifulSoup
 from bs4 import UnicodeDammit
@@ -66,7 +67,7 @@ def _get_html(url: str, timeout: int = 15) -> str:
 
 # ===================== WIN5 race_idとrace_date 抽出 =====================
 def _extract_ids_from_html(html: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     ids, seen = [], set()
     for a in soup.find_all("a", href=True):
         m = RACE_ID_RE.search(a["href"])
@@ -79,7 +80,7 @@ def _extract_ids_from_html(html: str) -> list[str]:
     return ids
 
 def _race_date(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
 
     # 年は WIN5ページ中の race_id=YYYY…… から取得
     year = ""
@@ -201,7 +202,7 @@ def parse_past_cell(td) -> tuple[str, str, str, str, str, str, str]:
 
 # ===================== レースメタ情報抽出 =====================
 def _extract_race_meta(html: str) -> tuple[str, str, str, str]:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
 
     name_el = soup.select_one(".RaceName")
     name = name_el.get_text(strip=True) if name_el else ""
@@ -298,14 +299,14 @@ def fetch_tansho_odds(race_id: str, timeout: int = 15) -> dict[str, float]:
     return result
 # ===================== リアルタイムオッズ取得 =====================
 
-def extract_horse_table(html: str) -> pd.DataFrame:
+def extract_horse_table(html: str) -> list[dict]:
     """
     馬柱(5走)テーブルから
     馬番, 馬名, 性齢, 騎手名,
     前走/2走/3走/4走の(レース名, 場所, コース, 着順,3F)
-    を DataFrame にして返す
+    を 1頭=1辞書 のリストにして返す
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
 
     table = soup.select_one("table.Shutuba_Past5_Table")
     if table is None:
@@ -374,23 +375,8 @@ def extract_horse_table(html: str) -> pd.DataFrame:
         record.update(past_data)
         records.append(record)
 
-    df = pd.DataFrame(records)
-
-    # 欲しい列の順番を明示しておく（馬番を先頭に追加）
-    cols = [
-        "馬番",
-        "馬名",
-        "性齢",
-        "騎手名",
-        "前走_レース名","前走_場所","前走_コース","前走_着順","前走_着差","前走_通過順","前走_３F",
-        "2走_レース名","2走_場所","2走_コース","2走_着順","2走_着差","2走_通過順","2走_３F",
-        "3走_レース名","3走_場所","3走_コース","3走_着順","3走_着差","3走_通過順","3走_３F",
-        "4走_レース名","4走_場所","4走_コース","4走_着順","4走_着差","4走_通過順","4走_３F",
-    ]
-    # 存在する列だけに絞る（念のため）
-    cols = [c for c in cols if c in df.columns]
-    df = df[cols]
-    return df
+    # 書き込みはテンプレートの列名と突き合わせるため、列順は問わない
+    return records
 
 # ===================== サイトからデータ取得 =====================
 
@@ -419,17 +405,17 @@ def safe_sheet_name(name: str, used: set[str]) -> str:
 # ===================== シート名安全化 =====================
 
 # ===================== テンプレートシートへデータ書き込み =====================
-def write_df_to_sheet(ws, df: pd.DataFrame):
-    """テンプレートの列名とDataFrameの列名を突き合わせて正しい列に書き込む"""
+def write_df_to_sheet(ws, records: list[dict]):
+    """テンプレートの列名とデータの列名を突き合わせて正しい列に書き込む"""
     # テンプレート1行目のヘッダーから 列名→列番号 マッピングを構築
     col_map: dict[str, int] = {}
     for cell in ws[1]:
         if cell.value is not None and not isinstance(cell, MergedCell):
             col_map[str(cell.value)] = cell.column
 
-    # DataFrameのデータを2行目から書き込む（列名でマッチング）
-    for r_idx, row_data in enumerate(df.itertuples(index=False), start=2):
-        for col_name, value in zip(df.columns, row_data):
+    # データを2行目から書き込む（列名でマッチング）
+    for r_idx, rec in enumerate(records, start=2):
+        for col_name, value in rec.items():
             if col_name not in col_map:
                 continue
             cell = ws.cell(row=r_idx, column=col_map[col_name])
@@ -437,13 +423,27 @@ def write_df_to_sheet(ws, df: pd.DataFrame):
                 continue
             if isinstance(cell.value, str) and cell.value.startswith("="):
                 continue
-            # NaN / pd.NA（枠順確定前の馬番など）は空セルにする
-            if value is not None and not isinstance(value, str) and pd.isna(value):
-                value = None
             cell.value = value
 # ===================== テンプレートシートへデータ書き込み =====================
 
+def fetch_race(rid: str):
+    """1レース分の馬柱・メタ情報・オッズをまとめて取得する（並列実行用）"""
+    race_url = f"https://race.netkeiba.com/race/shutuba_past.html?race_id={rid}&rf=shutuba_submenu"
+    html = _get_html(race_url)
+    _, name, place, rnum = _extract_race_meta(html)
+    records = extract_horse_table(html)
+
+    # リアルタイム単勝オッズをテンプレートの「オッズ」列に反映
+    odds_map = fetch_tansho_odds(rid)
+    if odds_map:
+        for rec in records:
+            rec["オッズ"] = odds_map.get(str(rec.get("馬番", "")).strip(), "")
+
+    return name, place, rnum, records
+
+
 def main():
+    t_start = time.time()
     # オプションで WIN5ページのURL上書きも可
     url_arg = sys.argv[1] if len(sys.argv) >= 2 else None
 
@@ -464,48 +464,42 @@ def main():
         print(f"テンプレートが見つかりません: {TEMPLATE_XLSX}")
         sys.exit(3)
 
-    # テンプレートをベースにワークブックを開く（書式・条件付き書式を引き継ぐ）
-    wb = load_workbook(TEMPLATE_XLSX)
-    template_sheets = wb.worksheets  # 既存5枚シート
+    # 全レースを並列取得しつつ、その間にテンプレートを読み込む
+    print(f"{len(race_ids)}レースを並列取得中…")
+    with ThreadPoolExecutor(max_workers=len(race_ids)) as ex:
+        futures = [ex.submit(fetch_race, rid) for rid in race_ids]
 
-    used_sheet_names: set[str] = set()
-    errors: list[str] = []
-    written = 0
+        # テンプレートをベースにワークブックを開く（書式・条件付き書式を引き継ぐ）
+        wb = load_workbook(TEMPLATE_XLSX)
+        template_sheets = wb.worksheets  # 既存5枚シート
 
-    for idx_r, rid in enumerate(race_ids):
-        if idx_r >= len(template_sheets):
-            print(f"[WARN] テンプレートシートが足りません（{idx_r+1}枚目なし）")
-            break
+        used_sheet_names: set[str] = set()
+        errors: list[str] = []
+        written = 0
 
-        ws = template_sheets[idx_r]
-        race_url = f"https://race.netkeiba.com/race/shutuba_past.html?race_id={rid}&rf=shutuba_submenu"
-        try:
-            html = _get_html(race_url)
-            _, name, place, rnum = _extract_race_meta(html)
-            sheet_title = name
-            if place and rnum:
-                sheet_title = f"{place}{rnum}_{name}"
-            sheet_title = safe_sheet_name(sheet_title, used_sheet_names)
-            print(f"[{written+1}] {sheet_title} に書き込み中…")
+        for idx_r, (rid, future) in enumerate(zip(race_ids, futures)):
+            if idx_r >= len(template_sheets):
+                print(f"[WARN] テンプレートシートが足りません（{idx_r+1}枚目なし）")
+                break
+            try:
+                name, place, rnum, records = future.result()
+                sheet_title = name
+                if place and rnum:
+                    sheet_title = f"{place}{rnum}_{name}"
+                sheet_title = safe_sheet_name(sheet_title, used_sheet_names)
 
-            df = extract_horse_table(html)
-
-            # リアルタイム単勝オッズをテンプレートの「オッズ」列に反映
-            odds_map = fetch_tansho_odds(rid)
-            if odds_map:
-                df["オッズ"] = df["馬番"].map(lambda x: odds_map.get(str(x).strip(), ""))
-
-            ws.title = sheet_title
-            write_df_to_sheet(ws, df)
-            print(f"[{written+1}] {sheet_title} に書き込み完了")
-            written += 1
-        except Exception as e:
-            msg = f"{rid}: {type(e).__name__}: {e}"
-            print("[SKIP]", msg)
-            errors.append(msg)
+                ws = template_sheets[idx_r]
+                ws.title = sheet_title
+                write_df_to_sheet(ws, records)
+                print(f"[{written+1}] {sheet_title} に書き込み完了（{len(records)}頭）")
+                written += 1
+            except Exception as e:
+                msg = f"{rid}: {type(e).__name__}: {e}"
+                print("[SKIP]", msg)
+                errors.append(msg)
 
     wb.save(out_xlsx)
-    print(f"出力完了: {out_xlsx}（{written}/{len(race_ids)}レース書き込み）")
+    print(f"出力完了: {out_xlsx}（{written}/{len(race_ids)}レース書き込み、{time.time() - t_start:.1f}秒）")
     if errors:
         print("エラーがあったレース:")
         for msg in errors:
