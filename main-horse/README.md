@@ -91,15 +91,13 @@ URL を直接指定して環境変数より優先させることもできます�
 ```
 requests          # HTTP 通信
 beautifulsoup4    # HTML パース
-pandas            # データフレーム処理
+lxml              # HTML パーサー（高速化）
 openpyxl          # Excel ファイル作成
-selenium          # ブラウザ自動化（インポートのみ、このスクリプトではは使用していません）
-webdriver-manager # Selenium ドライバー管理
 ```
 
 インストール：
 ```bash
-pip install requests beautifulsoup4 pandas openpyxl selenium webdriver-manager
+pip install requests beautifulsoup4 lxml openpyxl
 ```
 
 ## 実装の特徴
