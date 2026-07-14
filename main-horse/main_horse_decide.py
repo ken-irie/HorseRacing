@@ -201,7 +201,7 @@ def parse_past_cell(td) -> tuple[str, str, str, str, str, str, str]:
     return race_name, place, course, finish, margin, passing, last3f
 
 # ===================== レースメタ情報抽出 =====================
-def _extract_race_meta(html: str) -> tuple[str, str, str, str]:
+def _extract_race_meta(html: str) -> tuple[str, str, str, str, str, str]:
     soup = BeautifulSoup(html, "lxml")
 
     name_el = soup.select_one(".RaceName")
@@ -261,7 +261,44 @@ def _extract_race_meta(html: str) -> tuple[str, str, str, str]:
     if m_r:
         rnum = m_r.group(1) + "R"
 
-    return race_date, name, place, rnum
+    return race_date, name, place, rnum, d1, d2
+
+
+def _parse_race_time(d1: str) -> str:
+    """RaceData01から発走時刻（HH:MM）を抽出する"""
+    m = re.search(r"(\d{1,2}:\d{2})", d1 or "")
+    return m.group(1) if m else ""
+
+
+def _parse_course_label(d1: str, d2: str) -> str:
+    """〇歳以上〇勝クラス〇メートル（芝・右）形式の文字列を組み立てる"""
+    d1 = d1 or ""
+    d2 = d2 or ""
+
+    # 距離（例: 1,800m / 3000m）
+    m = re.search(r"([\d,]+)\s*m", d1)
+    dist = f"{m.group(1)}メートル" if m else ""
+
+    # 芝/ダート と 右/左/直線（netkeiba表記は「ダ1700m (右)」「芝1800m (右 A)」など）
+    m_surf = re.search(r"(障害|障|ダート|ダ|芝)", d1)
+    m_dir  = re.search(r"[(（]\s*(右|左|直線)", d1)
+    surf_map = {"芝": "芝", "ダ": "ダート", "ダート": "ダート", "障": "障害", "障害": "障害"}
+    surf = surf_map.get(m_surf.group(1), "") if m_surf else ""
+    drct = m_dir.group(1) if m_dir else ""
+    if surf and drct:
+        course = f"（{surf}・{drct}）"
+    elif surf:
+        course = f"（{surf}）"
+    else:
+        course = ""
+
+    # 年齢条件（例: 4歳以上 / 3歳）とクラス条件をd2から抽出
+    m_age = re.search(r"(\d+歳[以上未満]*)", d2)
+    age = m_age.group(1) if m_age else ""
+    m_cls = re.search(r"(\d+勝クラス|オープン|G[IⅠ1iIVX]{1,3}|ハンデ|混合|牝馬限定)", d2)
+    cls = m_cls.group(1) if m_cls else ""
+
+    return f"{age}{cls}{dist}{course}".strip()
 
 # ===================== サイトからデータ取得 =====================
 
@@ -366,11 +403,69 @@ def extract_horse_table(html: str) -> list[dict]:
             past_data[f"{label}_通過順"] = passing
             past_data[f"{label}_３F"] = last3f
 
+        # ───────── 追加項目 ─────────
+        # ハンデ（今走の斤量）: td.Jockey 内の数値スパン（例: 58.0）
+        handicap = ""
+        td_j = tr.select_one("td.Jockey")
+        if td_j:
+            for sp in td_j.select("span"):
+                t = sp.get_text(strip=True)
+                if re.fullmatch(r"\d{2}(?:\.\d)?", t):
+                    handicap = float(t)
+                    break
+
+        # 前走セルから 騎手名・走破タイム・馬体重 を取得
+        prev_jockey = ""
+        prev_time = ""
+        prev_weight = ""
+        if past_tds:
+            fp = past_tds[0]
+            d3 = fp.select_one("div.Data03")
+            if d3:
+                # 例: "14頭 11番 1人 ルメール 58.0" → 数値始まり以外の最後のトークンが騎手名
+                for tok in d3.get_text(" ", strip=True).split():
+                    if not re.match(r"^[\d]", tok):
+                        prev_jockey = tok
+            d5 = fp.select_one("div.Data05")
+            if d5:
+                mt = re.search(r"\d:\d{2}\.\d", d5.get_text(" ", strip=True))
+                if mt:
+                    prev_time = mt.group(0)
+            d6 = fp.select_one("div.Data06")
+            if d6:
+                mw = re.search(r"\d{3}\([+\-±0-9]*\)", d6.get_text(" ", strip=True))
+                if mw:
+                    prev_weight = mw.group(0)
+
+        # 騎手乗替: 今走騎手と前走騎手の比較
+        # netkeibaは短縮表記（例: ルメー/ルメール、Ｍデム/Ｍ．デム）のため、
+        # 記号を除去したうえで前方一致なら同一騎手とみなす
+        jockey_change = ""
+        norm = lambda s: re.sub(r"[\s．.・･]", "", s)
+        a, b = norm(jockey_name), norm(prev_jockey)
+        if a and b and not (a.startswith(b) or b.startswith(a)):
+            jockey_change = "乗替"
+
+        # 3着内率: 馬柱にある過去走（最大5走）の着順から算出
+        finishes = []
+        for td in past_tds[:5]:
+            num = td.select_one("div.Data01 span.Num")
+            if num:
+                t = num.get_text(strip=True)
+                if t.isdigit():
+                    finishes.append(int(t))
+        top3_rate = round(sum(1 for f in finishes if f <= 3) / len(finishes), 3) if finishes else ""
+
         record = {
             "馬番": uma_no,
             "馬名": horse_name,
             "性齢": sex_age,
             "騎手名": jockey_name,
+            "ハンデ": handicap,
+            "馬体重": prev_weight,
+            "騎手乗替": jockey_change,
+            "3着内率": top3_rate,
+            "タイム": prev_time,
         }
         record.update(past_data)
         records.append(record)
@@ -430,7 +525,7 @@ def fetch_race(rid: str):
     """1レース分の馬柱・メタ情報・オッズをまとめて取得する（並列実行用）"""
     race_url = f"https://race.netkeiba.com/race/shutuba_past.html?race_id={rid}&rf=shutuba_submenu"
     html = _get_html(race_url)
-    _, name, place, rnum = _extract_race_meta(html)
+    _, name, place, rnum, d1, d2 = _extract_race_meta(html)
     records = extract_horse_table(html)
 
     # リアルタイム単勝オッズをテンプレートの「オッズ」列に反映
@@ -439,7 +534,7 @@ def fetch_race(rid: str):
         for rec in records:
             rec["オッズ"] = odds_map.get(str(rec.get("馬番", "")).strip(), "")
 
-    return name, place, rnum, records
+    return name, place, rnum, d1, d2, records
 
 
 def main():
@@ -482,7 +577,7 @@ def main():
                 print(f"[WARN] テンプレートシートが足りません（{idx_r+1}枚目なし）")
                 break
             try:
-                name, place, rnum, records = future.result()
+                name, place, rnum, d1, d2, records = future.result()
                 sheet_title = name
                 if place and rnum:
                     sheet_title = f"{place}{rnum}_{name}"
@@ -491,6 +586,12 @@ def main():
                 ws = template_sheets[idx_r]
                 ws.title = sheet_title
                 write_df_to_sheet(ws, records)
+
+                # レース情報（D25: 発走時刻 / D26: シート名 / D27: 条件・距離）
+                ws["D25"] = _parse_race_time(d1)
+                ws["D26"] = sheet_title
+                ws["D27"] = _parse_course_label(d1, d2)
+
                 print(f"[{written+1}] {sheet_title} に書き込み完了（{len(records)}頭）")
                 written += 1
             except Exception as e:
